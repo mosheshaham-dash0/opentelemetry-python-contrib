@@ -401,6 +401,50 @@ class TestBotocoreInstrumentor(TestBase):
             set_global_textmap(previous_propagator)
 
     @mock_aws
+    def test_propagator_injects_with_lambda_recursion_detection_header(self):
+        # Inside AWS Lambda, botocore's add_recursion_detection_header handler
+        # copies _X_AMZN_TRACE_ID into X-Amzn-Trace-Id on every outgoing
+        # request before the instrumentation runs. That stale runtime context
+        # must be overwritten with the current span context, not treated as an
+        # already-injected header.
+        runtime_trace_header = (
+            "Root=1-00000000-000000000000000000000000;Parent=0000000000000000;Sampled=0"
+        )
+        headers = {}
+
+        def check_headers(**kwargs):
+            nonlocal headers
+            headers = kwargs["request"].headers
+
+        with patch.dict(
+            os.environ,
+            {
+                "AWS_LAMBDA_FUNCTION_NAME": "some-function",
+                "_X_AMZN_TRACE_ID": runtime_trace_header,
+            },
+        ):
+            ec2 = self._make_client("ec2")
+            ec2.meta.events.register_first(
+                "before-send.ec2.DescribeInstances", check_headers
+            )
+            ec2.describe_instances()
+
+        request_id = "fdcdcab1-ae5c-489e-9c33-4637c5dda355"
+        span = self.assert_span(
+            "EC2", "DescribeInstances", request_id=request_id
+        )
+
+        self.assertIn(TRACE_HEADER_KEY, headers)
+        xray_context = headers[TRACE_HEADER_KEY]
+        self.assertNotEqual(xray_context, runtime_trace_header)
+        formated_trace_id = format_trace_id(span.get_span_context().trace_id)
+        formated_trace_id = formated_trace_id[:8] + "-" + formated_trace_id[8:]
+        self.assertEqual(
+            xray_context.lower(),
+            f"root=1-{formated_trace_id};parent={format_span_id(span.get_span_context().span_id)};sampled=1".lower(),
+        )
+
+    @mock_aws
     def test_no_op_tracer_provider_xray(self):
         BotocoreInstrumentor().uninstrument()
         BotocoreInstrumentor().instrument(

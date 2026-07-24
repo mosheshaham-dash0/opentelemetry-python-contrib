@@ -108,7 +108,9 @@ for example:
 """
 
 import logging
+import os
 from typing import Any, Collection, Dict, Optional, Tuple
+from urllib.parse import quote
 
 from botocore.client import BaseClient
 from botocore.endpoint import Endpoint
@@ -159,6 +161,31 @@ from opentelemetry.semconv._incubating.attributes.rpc_attributes import (
 from opentelemetry.trace.span import Span
 
 logger = logging.getLogger(__name__)
+
+
+def _get_lambda_recursion_detection_header() -> Optional[str]:
+    """Returns the value that botocore's ``add_recursion_detection_header``
+    handler sets on every outgoing request inside AWS Lambda (see
+    ``botocore.handlers``), or ``None`` when not running in Lambda.
+
+    That header carries the Lambda runtime's X-Ray context from the
+    ``_X_AMZN_TRACE_ID`` environment variable, not the current span context,
+    so it must not be treated as an already-injected trace header.
+    """
+    trace_id = os.environ.get("_X_AMZN_TRACE_ID")
+    if "AWS_LAMBDA_FUNCTION_NAME" in os.environ and trace_id:
+        return quote(trace_id, safe="-=;:+&[]{}\"',")
+    return None
+
+
+def _should_skip_injection(headers) -> bool:
+    """Skip injection only when the trace header was injected by another
+    OTel instrumentation (e.g. botocore and aiobotocore instrumented at the
+    same time), never when it is botocore's own Lambda recursion-detection
+    header, which would otherwise suppress trace propagation in Lambda."""
+    if TRACE_HEADER_KEY not in headers:
+        return False
+    return headers[TRACE_HEADER_KEY] != _get_lambda_recursion_detection_header()
 
 
 class BotocoreInstrumentor(BaseInstrumentor):
@@ -232,8 +259,10 @@ class BotocoreInstrumentor(BaseInstrumentor):
         # There may be situations where both Botocore and Aiobotocore are
         # instrumented at the same time. To avoid double-injection of headers,
         # we add a check to see if the header is already present. If it is,
-        # we skip injection.
-        if TRACE_HEADER_KEY in headers:
+        # we skip injection. Botocore's own recursion-detection header
+        # (copied from _X_AMZN_TRACE_ID inside AWS Lambda) is overwritten
+        # instead, as it does not carry the current span context.
+        if _should_skip_injection(headers):
             return wrapped(*args, **kwargs)
 
         # Only the x-ray header is propagated by AWS services. Using any
@@ -392,8 +421,10 @@ class AiobotocoreInstrumentor(BaseInstrumentor):
         # There may be situations where both Botocore and Aiobotocore are
         # instrumented at the same time. To avoid double-injection of headers,
         # we add a check to see if the header is already present. If it is,
-        # we skip injection.
-        if TRACE_HEADER_KEY in headers:
+        # we skip injection. Botocore's own recursion-detection header
+        # (copied from _X_AMZN_TRACE_ID inside AWS Lambda) is overwritten
+        # instead, as it does not carry the current span context.
+        if _should_skip_injection(headers):
             return wrapped(*args, **kwargs)
 
         # Only the x-ray header is propagated by AWS services. Using any
